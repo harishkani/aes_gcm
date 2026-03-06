@@ -39,9 +39,11 @@ module aes_gcm_top_hp (
 
     input             go,
     input  [127:0]    key,
-    input  [95:0]     iv,
-    input  [3:0]      n_aad,
-    input  [3:0]      n_pt,
+    input  [127:0]    y0,           // Pre-computed Y0 (testbench provides; standard 96-bit IV: {iv,0^31,1})
+    input  [3:0]      n_aad,        // Number of 128-bit AAD blocks (ceil)
+    input  [3:0]      n_pt,         // Number of 128-bit PT blocks (ceil)
+    input  [63:0]     aad_len_bits, // Actual AAD length in bits (for GHASH len block)
+    input  [63:0]     pt_len_bits,  // Actual PT  length in bits (for GHASH len block)
 
     input  [127:0]    aad_in,
     input             aad_valid,
@@ -61,7 +63,9 @@ module aes_gcm_top_hp (
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-wire [127:0] Y0 = {iv, 31'h0, 1'b1};
+// Y0 is provided directly via the y0 port (pre-computed by the caller).
+// For a standard 96-bit IV the caller sets y0 = {iv, 31'h0, 1'b1}.
+// For non-96-bit IVs the caller provides GHASH-derived Y0 (see test cases 5-6).
 
 function [127:0] incr32;
     input [127:0] c;
@@ -159,8 +163,10 @@ reg [127:0] H_reg, EY0_reg;
 reg [3:0]   ct_ghash_cnt;   // # CT blocks fed to GHASH
 reg         ct_ghash_done;  // REGISTERED: high one cycle after last CT finished
 
-wire [127:0] len_block = { {53'h0, n_aad_r, 7'h0},
-                            {53'h0, n_pt_r,  7'h0} };
+// len_block = {64-bit len(A) in bits, 64-bit len(C) in bits}
+// Using the actual bit-lengths supplied by the caller so partial-block
+// messages (e.g. TC4/5/6 where len(A)=160 and len(C)=480) are correct.
+wire [127:0] len_block = { aad_len_bits, pt_len_bits };
 
 // ---------------------------------------------------------------------------
 // GCTR -> GHASH FIFO (Depth 16)
@@ -173,7 +179,13 @@ reg [4:0]   fifo_cnt;
 
 // Note: fifo_pop uses state != S_IDLE to ensure cleanly flushing.
 wire fifo_push = gctr_ct_v;
-wire fifo_pop  = (fifo_cnt > 0) && ghash_ready && (ct_ghash_cnt < n_pt_r) && (state != S_IDLE);
+wire fifo_pop  = (fifo_cnt > 0) && ghash_ready && !ghash_vin && (ct_ghash_cnt < n_pt_r) && (state != S_IDLE);
+
+// Partial last CT block masking for GHASH:
+// GCM requires zero-padding partial blocks; GCTR outputs raw keystream XOR in pad bytes.
+// pt_len_bits[6:0] = valid bits in last block (0 = block-aligned).
+wire        pt_last_partial = (pt_len_bits[6:0] != 7'd0);
+wire [7:0]  ct_zero_bits    = 8'd128 - {1'b0, pt_len_bits[6:0]};  // pad bits to clear
 
 // ---------------------------------------------------------------------------
 // Sequential logic
@@ -228,7 +240,11 @@ always @(posedge clk) begin
             fifo_wr <= fifo_wr + 4'd1;
         end
         if (fifo_pop) begin
-            ghash_din     <= fifo_data[fifo_rd];
+            // Zero the padding bytes of the last CT block (GCM spec requires zero-padding)
+            if (pt_last_partial && (ct_ghash_cnt == n_pt_r - 4'd1))
+                ghash_din <= fifo_data[fifo_rd] & ({128{1'b1}} << ct_zero_bits);
+            else
+                ghash_din <= fifo_data[fifo_rd];
             ghash_vin     <= 1'b1;
             ct_ghash_cnt  <= ct_ghash_cnt + 4'd1;
             fifo_rd <= fifo_rd + 4'd1;
@@ -275,7 +291,7 @@ always @(posedge clk) begin
             end
 
             S_INIT1: begin
-                init_aes_in    <= Y0;
+                init_aes_in    <= y0;
                 init_aes_valid <= 1'b1;
                 state          <= S_WAIT_H;
             end
@@ -288,7 +304,7 @@ always @(posedge clk) begin
                     end else begin
                         EY0_reg        <= init_aes_out;
                         ghash_H        <= H_reg;
-                        gctr_start_ctr <= incr32(Y0);
+                        gctr_start_ctr <= incr32(y0);
                         state          <= S_GRST;
                     end
                 end
@@ -314,7 +330,7 @@ always @(posedge clk) begin
             end
 
             S_AAD: begin
-                if (aad_valid && ghash_ready && !gctr_ct_v) begin
+                if (aad_valid && ghash_ready && !ghash_vin && !gctr_ct_v) begin
                     ghash_din <= aad_in;
                     ghash_vin <= 1'b1;
                     aad_cnt   <= aad_cnt + 4'd1;
@@ -369,7 +385,7 @@ always @(posedge clk) begin
 end
 
 assign pt_ready  = (state == S_DATA);
-assign aad_ready = (state == S_AAD) && ghash_ready && !gctr_ct_v;
+assign aad_ready = (state == S_AAD) && ghash_ready && !ghash_vin && !gctr_ct_v;
 
 endmodule
 
